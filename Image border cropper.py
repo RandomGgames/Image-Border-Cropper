@@ -5,20 +5,60 @@ import traceback
 import typing
 
 from datetime import datetime
+from PIL import Image, ImageGrab, ImageChops
 
 import logging
 logger = logging.getLogger(__name__)
 
-"""
-Python Script Template
-"""
+BORDER_SIZE = 40
+
+
+def crop_to_object(image: Image.Image, border: int = 40) -> Image.Image:
+    bg_color = image.getpixel((0, 0))  # Assume top-left is background
+    bg_image = Image.new(image.mode, image.size, bg_color)
+    diff = ImageChops.difference(image, bg_image).convert("L")
+
+    # Enhance contrast slightly for better bounding box detection
+    diff = diff.point(lambda x: 255 if x > 10 else 0)
+
+    bbox = diff.getbbox()
+    if not bbox:
+        logger.warning("No object detected in image.")
+        return image
+
+    left = max(bbox[0] - border, 0)
+    upper = max(bbox[1] - border, 0)
+    right = min(bbox[2] + border, image.width)
+    lower = min(bbox[3] + border, image.height)
+
+    cropped = image.crop((left, upper, right, lower))
+    logger.info(f"Cropped image to box: ({left}, {upper}, {right}, {lower})")
+    return cropped
+
+
+def save_image(image: Image.Image, out_path: pathlib.Path) -> None:
+    image.save(out_path)
+    logger.info(f"Saved cropped image to: {out_path}")
 
 
 def main() -> None:
     start_time = time.perf_counter()
     logger.info("Starting operation...")
 
-    pass
+    try:
+        image = ImageGrab.grabclipboard()
+        if not isinstance(image, Image.Image):
+            logger.error("No image found in clipboard.")
+            return
+
+        logger.info(f"Clipboard image size: {image.size}")
+        cropped = crop_to_object(image, BORDER_SIZE)
+
+        out_path = pathlib.Path("cropped_output.png")
+        save_image(cropped, out_path)
+
+    except Exception as e:
+        logger.exception(f"Error during processing: {e}")
 
     end_time = time.perf_counter()
     duration = end_time - start_time
