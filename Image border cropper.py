@@ -13,7 +13,7 @@ import io
 
 import logging
 logger = logging.getLogger(__name__)
-BORDER_SIZE = 40
+BORDER_SIZE = 30
 POLL_INTERVAL = 1  # seconds
 
 
@@ -71,8 +71,6 @@ def monitor_clipboard():
                     cropped = crop_to_object(img, BORDER_SIZE)
                     image_to_clipboard(cropped)
                     last_hash = current_hash
-            else:
-                logger.debug("Clipboard does not contain an image.")
         except Exception as e:
             logger.warning(f"Clipboard polling error: {e}")
 
