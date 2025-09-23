@@ -104,11 +104,14 @@ def on_clipboard_update(hwnd, msg, wparam, lparam):
                 return 0
 
             win32clipboard.OpenClipboard()
-            has_text = win32clipboard.IsClipboardFormatAvailable(win32con.CF_TEXT)
+            has_text = (
+                win32clipboard.IsClipboardFormatAvailable(win32con.CF_TEXT) or
+                win32clipboard.IsClipboardFormatAvailable(win32con.CF_UNICODETEXT)
+            )
             win32clipboard.CloseClipboard()
 
             if has_text:
-                logger.info("Clipboard contains text. Skipping image processing.")
+                logger.info("Clipboard contains text/numbers. Skipping image processing.")
                 return 0
 
             img = ImageGrab.grabclipboard()
