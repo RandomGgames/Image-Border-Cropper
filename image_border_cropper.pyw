@@ -1,9 +1,23 @@
 """
-{Script Name}
+Image Border Cropper
 
-{Summary of what the script does}
+A Windows utility script that monitors the clipboard for new images, automatically crops out uniform borders,
+and replaces the clipboard image with the cropped version. The script runs in the background with a system tray icon,
+providing quick access to the script folder and an exit option.
 
-{How to use the script}
+Features:
+- Monitors clipboard for new images (ignores text and duplicate images).
+- Crops images to remove uniform borders, preserving a configurable border size.
+- Updates the clipboard with the cropped image.
+- Runs as a background process with a system tray icon for user interaction.
+- Configurable via a TOML file for logging, border size, and exit behavior.
+
+How to use:
+1. Place a configuration TOML file named `{script_name}_config.toml` in the same directory as this script.
+2. Run the script. It will appear as a tray icon.
+3. Copy an image to the clipboard (e.g., using Print Screen or Snipping Tool).
+4. The script will automatically crop the image and update the clipboard.
+5. Use the tray icon to open the script folder or exit the application.
 """
 
 import ctypes
@@ -13,7 +27,6 @@ import io
 import json
 import logging
 import os
-import pyperclip
 import send2trash
 import socket
 import sys
@@ -29,6 +42,7 @@ from pathlib import Path
 from PIL import Image
 from PIL import Image, ImageGrab, ImageChops
 from pystray import Icon, MenuItem, Menu
+from ctypes import wintypes
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +53,46 @@ CONFIG = {}
 WM_CLIPBOARDUPDATE = 0x031D
 last_hash = None
 ignore_next = False
+hwnd = None
+tray_icon = None
+
+exit_event = threading.Event()
+
+
+def load_image(path: str | Path) -> Image.Image:
+    path = Path(path)
+    image = Image.open(path)
+    logger.debug(f"Loaded image at path {json.dumps(str(path))}")
+    return image
+
+
+def open_script_folder():
+    folder_path = os.path.dirname(os.path.abspath(__file__))
+    os.startfile(folder_path)
+    logger.debug(f"Opened script folder: {json.dumps(str(folder_path))}")
+
+
+def on_exit(icon):
+    global hwnd, tray_icon
+    logger.debug("Exit pressed on system tray icon")
+    if tray_icon:
+        tray_icon.stop()
+        logger.debug("Tray icon stopped")
+    if hwnd:
+        win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+    exit_event.set()
+
+
+def startup_tray_icon():
+    global tray_icon
+    logger.debug("Starting system tray icon...")
+    image = load_image("system_tray_icon.png")
+    menu = Menu(
+        MenuItem("Open Folder", open_script_folder),
+        MenuItem("Exit", on_exit)
+    )
+    tray_icon = Icon("ClipboardWatcher", image, menu=menu)
+    tray_icon.run()
 
 
 def get_background_color(image: Image.Image):
@@ -146,15 +200,22 @@ def on_clipboard_update(hwnd, msg, wparam, lparam):
                 ignore_next = True
         except Exception as e:
             logger.warning(f"Clipboard processing error: {e}")
+    elif msg == win32con.WM_DESTROY:
+        # Stop message pump
+        win32gui.PostQuitMessage(0)
+        return 0
     return 0
 
 
 def main():
-    border_size = CONFIG.get("border_size", None)
-    if border_size is None:
-        logger.warning("Failed to read config border_size key. Using default value (10)")
-        CONFIG["border_size"] = 10
+    border_size = CONFIG.get("border_size", 10)
+    CONFIG["border_size"] = border_size
 
+    # Start system tray icon
+    system_tray_thread = threading.Thread(target=startup_tray_icon, daemon=True)
+    system_tray_thread.start()
+
+    # Setup hidden window for clipboard listener
     wc = typing.cast(typing.Any, win32gui.WNDCLASS())
     wc.lpfnWndProc = on_clipboard_update
     wc.lpszClassName = "ClipboardWatcher"
@@ -162,6 +223,7 @@ def main():
     wc.hInstance = hinst
     classAtom = win32gui.RegisterClass(wc)
 
+    global hwnd
     hwnd = win32gui.CreateWindow(
         classAtom,
         "ClipboardWatcher",
@@ -176,7 +238,14 @@ def main():
         raise ctypes.WinError()
 
     logger.info("Started clipboard listener (event-driven).")
-    win32gui.PumpMessages()
+    user32 = ctypes.windll.user32
+
+    while not exit_event.is_set():
+        msg = wintypes.MSG()
+        while user32.PeekMessageW(ctypes.byref(msg), 0, 0, 0, 1):
+            user32.TranslateMessage(ctypes.byref(msg))
+            user32.DispatchMessageW(ctypes.byref(msg))
+        time.sleep(0.05)  # small sleep to avoid 100% CPU
 
 
 def enforce_max_log_count(dir_path: Path | str, max_count: int | None, script_name: str) -> None:
