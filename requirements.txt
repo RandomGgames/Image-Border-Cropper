@@ -1,5 +1,5 @@
 Send2Trash
 pillow
+pyperclip
 pystray
 pywin32
-win32con
