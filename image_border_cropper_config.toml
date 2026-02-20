@@ -1,5 +1,10 @@
-# Ammount of pixels to leave around the cropped area
-border_size = 10
+# Ammount of pixels to leave around the cropped area.
+# Default: 10
+padding = 10
+
+# Increase this if gradients aren't being cut out properly.
+# Default: 1
+tolerance = 1
 
 [exit_behavior]
 always_pause = false

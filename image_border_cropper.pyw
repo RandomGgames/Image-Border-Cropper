@@ -20,42 +20,35 @@ How to use:
 5. Use the tray icon to open the script folder or exit the application.
 """
 
-import ctypes
 import datetime
 import hashlib
 import io
 import json
 import logging
 import os
+import pyperclip
 import send2trash
 import socket
 import sys
 import threading
 import time
 import tomllib
-import typing
+import webbrowser
 import win32clipboard
-import win32con
-import win32gui
 from datetime import datetime
 from pathlib import Path
-from PIL import Image, ImageGrab, ImageChops
+from PIL import Image, ImageGrab, ImageChops, ImageOps
 from pystray import Icon, MenuItem, Menu
-from ctypes import wintypes
 
 logger = logging.getLogger(__name__)
 
-__version__ = "2.0.1"  # Major.Minor.Patch
-
-CONFIG = {}
-
-WM_CLIPBOARDUPDATE = 0x031D
-last_hash = None
-ignore_next = False
-hwnd = None
-tray_icon = None
+__version__ = "2.1.0"  # Major.Minor.Patch
 
 exit_event = threading.Event()
+running_event = threading.Event()
+running_event.set()
+
+CONFIG = {}
 
 
 def load_image(path: str | Path) -> Image.Image:
@@ -65,186 +58,188 @@ def load_image(path: str | Path) -> Image.Image:
     return image
 
 
+def open_source_url():
+    webbrowser.open("https://github.com/RandomGgames/image_border_cropper.py")
+    logger.debug("Opened source URL.")
+
+
+def open_issues_url():
+    webbrowser.open("https://github.com/RandomGgames/image_border_cropper.py/issues")
+    logger.debug("Opened issues URL.")
+
+
 def open_script_folder():
     folder_path = os.path.dirname(os.path.abspath(__file__))
     os.startfile(folder_path)
     logger.debug(f"Opened script folder: {json.dumps(str(folder_path))}")
 
 
-def on_exit():
-    global hwnd, tray_icon
+def toggle_pause(icon):
+    """Toggle pause state."""
+    if running_event.is_set():
+        running_event.clear()
+        logger.info("Paused clipboard monitor.")
+    else:
+        running_event.set()
+        logger.info("Resumed clipboard monitor.")
+
+    icon.update_menu()
+
+
+def pause_checked(_):
+    """Return True when paused."""
+    return not running_event.is_set()
+
+
+def on_exit(icon):
     logger.debug("Exit pressed on system tray icon")
-    if tray_icon:
-        tray_icon.stop()
-        logger.debug("Tray icon stopped")
-    if hwnd:
-        win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+    icon.stop()
+    logger.debug("System tray icon stopped.")
     exit_event.set()
+    logger.debug("Exit event triggered")
 
 
 def startup_tray_icon():
-    global tray_icon
-    logger.debug("Starting system tray icon...")
+    logger.debug("Starting up system tray icon...")
+
     image = load_image("system_tray_icon.png")
+
     menu = Menu(
-        MenuItem("Open Folder", open_script_folder),
-        MenuItem("Exit", on_exit)
+        MenuItem(f"Image Border Cropper v{__version__}", None, enabled=False),
+        Menu.SEPARATOR,
+        MenuItem("Pause Clipboard Monitor", toggle_pause, checked=pause_checked),
+        Menu.SEPARATOR,
+        MenuItem("Source Page", open_source_url),
+        MenuItem("Issues Page", open_issues_url),
+        MenuItem("Open File Path", open_script_folder),
+        Menu.SEPARATOR,
+        MenuItem("Exit", on_exit),
     )
-    tray_icon = Icon("ClipboardWatcher", image, menu=menu)
-    tray_icon.run()
+
+    icon = Icon("Clipboard Whitespace Trimmer", image, menu=menu)
+
+    logger.debug("Started system tray icon.")
+    icon.run()
 
 
-def get_background_color(image: Image.Image):
-    """Guess background color from image corners."""
-    corners = [
-        image.getpixel((0, 0)),
-        image.getpixel((image.width - 1, 0)),
-        image.getpixel((0, image.height - 1)),
-        image.getpixel((image.width - 1, image.height - 1)),
-    ]
-    return max(set(corners), key=corners.count)
+def trim_image_borders(img, border_width):
+    """Shaves off pixels from all sides using ImageOps."""
+    # This removes the border_width from Left, Top, Right, and Bottom
+    return ImageOps.crop(img, border=border_width)
 
 
-def crop_to_object(image: Image.Image, border: int = 40) -> Image.Image:
-    bg_color = get_background_color(image)
-    bg_image = Image.new(image.mode, image.size, bg_color)
-    diff = ImageChops.difference(image, bg_image).convert("L")
-    diff = diff.point(lambda x: 255 if x > 10 else 0)  # type: ignore[arg-type]
-
-    bbox = diff.getbbox()
-    if not bbox:
-        logger.warning("No object detected.")
-        return image
-
-    # Desired crop with border
-    left = bbox[0] - border
-    upper = bbox[1] - border
-    right = bbox[2] + border
-    lower = bbox[3] + border
-
-    # Compute needed padding if crop exceeds original image
-    pad_left = max(0, -left)
-    pad_top = max(0, -upper)
-    pad_right = max(0, right - image.width)
-    pad_bottom = max(0, lower - image.height)
-
-    # Crop and expand if needed
-    cropped = image.crop((
-        max(left, 0),
-        max(upper, 0),
-        min(right, image.width),
-        min(lower, image.height),
-    ))
-
-    if any((pad_left, pad_top, pad_right, pad_bottom)):
-        new_width = cropped.width + pad_left + pad_right
-        new_height = cropped.height + pad_top + pad_bottom
-        new_img = Image.new(image.mode, (new_width, new_height), bg_color)
-        new_img.paste(cropped, (pad_left, pad_top))
-        return new_img
-
-    return cropped
-
-
-def image_to_clipboard(image: Image.Image) -> None:
-    """Copy an image to the Windows clipboard in DIB format."""
+def send_image_to_clipboard(img):
+    """Converts PIL image to Windows DIB format and updates clipboard."""
     output = io.BytesIO()
-    image.convert("RGB").save(output, format="BMP")
-    data = output.getvalue()[14:]  # Strip BMP header
+    img.convert("RGB").save(output, "BMP")  # Convert to RGB to ensure BMP compatibility
+    data = output.getvalue()[14:]  # Remove the 14-byte BMP file header to satisfy Windows CF_DIB format
     output.close()
 
-    win32clipboard.OpenClipboard()
-    win32clipboard.EmptyClipboard()
-    win32clipboard.SetClipboardData(win32con.CF_DIB, data)
-    win32clipboard.CloseClipboard()
-    logger.info("Updated clipboard with cropped image.")
+    win32clipboard.OpenClipboard()  # pylint: disable=c-extension-no-member
+    try:
+        win32clipboard.EmptyClipboard()  # pylint: disable=c-extension-no-member
+        win32clipboard.SetClipboardData(win32clipboard.CF_DIB, data)  # pylint: disable=c-extension-no-member
+    finally:
+        win32clipboard.CloseClipboard()  # pylint: disable=c-extension-no-member
 
 
-def image_hash(image: Image.Image) -> str:
-    """Generate a hash of image content for change detection."""
-    with io.BytesIO() as f:
-        image.save(f, format='PNG')
-        return hashlib.sha256(f.getvalue()).hexdigest()
+def trim_to_content(img, padding=10, tolerance=30):
+    """
+    Automatically crops the image to the object in the center.
+    - tolerance: 0 to 255 (how different a pixel must be from the corner to be 'content')
+    - padding: how many pixels of the original background to keep around the object
+    """
+    img = img.convert("RGBA")
+    bg_color = img.getpixel((0, 0))
+    bg = Image.new("RGBA", img.size, bg_color)
+    diff = ImageChops.difference(img, bg)
+    diff = diff.convert("L")
+    lut = [255 if i > tolerance else 0 for i in range(256)]
+    mask = diff.point(lut)
+    bbox = mask.getbbox()
+    if not bbox:
+        return img  # Return original if no object found (image is all one color)
+    left, top, right, bottom = bbox
+    left = max(0, left - padding)
+    top = max(0, top - padding)
+    right = min(img.width, right + padding)
+    bottom = min(img.height, bottom + padding)
+    return img.crop((left, top, right, bottom))
 
 
-def on_clipboard_update(hwnd, msg, wparam, lparam):
-    global last_hash, ignore_next
-    if msg == WM_CLIPBOARDUPDATE:
-        try:
-            if ignore_next:
-                ignore_next = False
-                return 0
+def trim_and_expand_border_to_content(img, padding=10, tolerance=30):
+    """
+    Standardizes the image border.
+    If the border is too big, it trims it.
+    If the border is too small, it expands it.
+    """
+    img = img.convert("RGBA")
+    bg_color = img.getpixel((0, 0))
+    bg = Image.new("RGBA", img.size, bg_color)
+    diff = ImageChops.difference(img, bg)
+    diff = diff.convert("L")
+    lut = [255 if i > tolerance else 0 for i in range(256)]
+    mask = diff.point(lut)
+    bbox = mask.getbbox()
+    if not bbox:
+        return img  # Return original if the image is a solid color
+    object_only = img.crop(bbox)
+    obj_w, obj_h = object_only.size
+    new_width = obj_w + (padding * 2)
+    new_height = obj_h + (padding * 2)
+    standardized_img = Image.new("RGBA", (new_width, new_height), bg_color)
+    standardized_img.paste(object_only, (padding, padding), object_only)
+    return standardized_img.convert("RGB")
 
-            win32clipboard.OpenClipboard()
-            has_text = (
-                win32clipboard.IsClipboardFormatAvailable(win32con.CF_TEXT) or
-                win32clipboard.IsClipboardFormatAvailable(win32con.CF_UNICODETEXT)
-            )
-            win32clipboard.CloseClipboard()
 
-            if has_text:
-                logger.info("Clipboard contains text/numbers. Skipping image processing.")
-                return 0
-
-            img = ImageGrab.grabclipboard()
-            if isinstance(img, Image.Image):
-                current_hash = image_hash(img)
-                if current_hash == last_hash:
-                    return 0  # same image, ignore
-
-                logger.info("New image detected in clipboard.")
-                cropped = crop_to_object(img, CONFIG.get("border_size", 10))
-                image_to_clipboard(cropped)
-                last_hash = image_hash(cropped)
-                ignore_next = True
-        except Exception as e:
-            logger.warning(f"Clipboard processing error: {e}")
-    elif msg == win32con.WM_DESTROY:
-        # Stop message pump
-        win32gui.PostQuitMessage(0)
-        return 0
-    return 0
+def get_image_hash(img):
+    """Generates a stable hash based on pixel data only."""
+    return hashlib.md5(img.convert("RGB").tobytes()).hexdigest()
 
 
 def main():
-    border_size = CONFIG.get("border_size", 10)
-    CONFIG["border_size"] = border_size
-
-    # Start system tray icon
     system_tray_thread = threading.Thread(target=startup_tray_icon, daemon=True)
     system_tray_thread.start()
 
-    # Setup hidden window for clipboard listener
-    wc = typing.cast(typing.Any, win32gui.WNDCLASS())
-    wc.lpfnWndProc = on_clipboard_update
-    wc.lpszClassName = "ClipboardWatcher"
-    hinst = win32gui.GetModuleHandle(None)
-    wc.hInstance = hinst
-    classAtom = win32gui.RegisterClass(wc)
+    PADDING = CONFIG.get("padding", 10)
+    TOLERANCE = CONFIG.get("tolerance", 30)
 
-    global hwnd
-    hwnd = win32gui.CreateWindow(
-        classAtom,
-        "ClipboardWatcher",
-        0, 0, 0, 0, 0,
-        0, 0,
-        hinst,
-        None,
-    )
+    logger.debug(f"Config Loaded - Padding: {PADDING}, Tolerance: {TOLERANCE}")
 
-    user32 = ctypes.windll.user32
-    if not user32.AddClipboardFormatListener(hwnd):
-        raise ctypes.WinError()
-
-    logger.info("Started clipboard listener (event-driven).")
-    user32 = ctypes.windll.user32
+    last_image_hash = None
 
     while not exit_event.is_set():
-        msg = wintypes.MSG()
-        while user32.PeekMessageW(ctypes.byref(msg), 0, 0, 0, 1):
-            user32.TranslateMessage(ctypes.byref(msg))
-            user32.DispatchMessageW(ctypes.byref(msg))
-        time.sleep(0.05)  # small sleep to avoid 100% CPU
+        running_event.wait()
+
+        try:
+            img = ImageGrab.grabclipboard()
+
+            if isinstance(img, Image.Image):
+                current_hash = get_image_hash(img)
+
+                if current_hash != last_image_hash:
+                    logger.debug("New image detected. Analyzing content...")
+                    processed_img = trim_and_expand_border_to_content(img, padding=PADDING, tolerance=TOLERANCE)
+                    processed_hash = get_image_hash(processed_img)
+
+                    if processed_hash != current_hash:
+                        logger.debug("Updating clipboard...")
+                        send_image_to_clipboard(processed_img)
+                        last_image_hash = processed_hash
+                        logger.info(f"Trimmed to content. New Hash: {last_image_hash}")
+                    else:
+                        last_image_hash = current_hash
+                        logger.debug("No borders detected. Skipping clipboard update.")
+
+            elif pyperclip.paste() == "":
+                last_image_hash = None
+
+        except Exception as e:
+            logger.error(f"Main loop error: {e}")
+
+        time.sleep(1)
+
+    logger.info("Exit event detected. Shutting down main loop.")
 
 
 def enforce_max_log_count(dir_path: Path | str, max_count: int | None, script_name: str) -> None:
@@ -403,16 +398,15 @@ def bootstrap():
 
         logger.info(f"Script: {json.dumps(script_name)} | Version: {__version__} | Host: {json.dumps(pc_name)}")
         main()
-        logger.info("Execution completed.")
 
     except KeyboardInterrupt:
         logger.warning("Operation interrupted by user.")
         exit_code = 130
-    except Exception as e:  # pylint: disable=broad-exception-caught
-        # Using 'err' or 'exc' is standard; logging the traceback handles the 'broad-except'
+    except Exception as e:
         logger.error(f"A fatal error has occurred: {e}")
         exit_code = 1
     finally:
+        logger.info("Closing loggers and existing.")
         for handler in logger.handlers[:]:
             handler.close()
             logger.removeHandler(handler)
